@@ -4,6 +4,8 @@ import argparse
 import csv
 import pathlib
 import re
+import subprocess
+import urllib.parse
 
 from datetime import datetime, timezone
 
@@ -11,6 +13,8 @@ import psutil
 import yaml
 
 from selenium import webdriver
+from selenium.webdriver.common.by import By
+from bs4 import BeautifulSoup
 
 BASE_PATH = pathlib.Path(__file__).absolute()
 INPUT_FILE = BASE_PATH.parent / 'pageviews.wmcloud.org-top400.yaml'
@@ -48,66 +52,109 @@ WP_NAMESPACES = [
     'Gadget_definition_talk',
 ]
 
-NS_REGEX = re.compile(rf'^{EN_WIKI}/({r"|".join(WP_NAMESPACES)})')
+NS_REGEX = re.compile(rf'^{EN_WIKI}/({r"|".join(WP_NAMESPACES)}):')
 
 
 class BatteryLog:
     def __init__(self, f):
         self.file = f
         self.writer = csv.writer(f)
+        cmd = 'find /sys/class/power_supply -name \'BAT*\''
+        bat_folder = subprocess.check_output(cmd, shell=True, text=True).strip()
+        self.voltage = pathlib.Path(bat_folder) / 'voltage_now'
+        self.power = pathlib.Path(bat_folder) / 'current_now'
+        self.track_watts = True
+        if not (self.voltage.exists() and self.power.exists()):
+            self.track_watts = False
         self.writer.writerow([
             'Timestamp',
-            'Load',
+            'CPU Percent',
             'Battery Percent',
             'Battery Seconds Remaining',
-            'Page'])
+            'Page',
+            'Watts',
+        ])
 
     def log(self, current_page):
         timestamp = datetime.now(timezone.utc).isoformat()
         battery = psutil.sensors_battery()
-        one_min_load = [
-            x / psutil.cpu_count() * 100
-            for x in psutil.getloadavg()
-        ][0]
+        cpu = psutil.cpu_percent()
+        watts = self.power_use()
         self.writer.writerow([
             timestamp,
-            one_min_load,
+            cpu,
             battery.percent,
             battery.secsleft,
-            current_page
+            current_page,
+            watts,
         ])
         self.file.flush()
-        print(f'{timestamp}, {one_min_load}, {battery.percent}, {battery.secsleft}, {current_page}')
+        print(f'{timestamp}, {cpu}, {battery.percent}, {battery.secsleft}, {current_page}, {watts}')
+
+    def power_use(self):
+        if not self.track_watts:
+            return '0W'
+        with open(self.voltage) as f:
+            cur_volts = int(f.read())
+        with open(self.power) as f:
+            cur_amps = int(f.read())
+        cur_watts = cur_volts * cur_amps / 1000000 / 1000000
+        return f'{cur_watts}W'
+
+def remove_first_parenthetical_links(soup):
+    within_parens = 0
+    first_parens_done = False
+    for string in soup.findAll(string=True):
+        if within_parens != 0 and string.parent.name == 'a':
+            string.parent.extract()
+            first_parens_done = True
+        if ')' in string.text:
+            within_parens = within_parens - string.text.count(')')
+            if within_parens == 0 and first_parens_done:
+                return
+        if '(' in string.text:
+            within_parens += string.text.count('(')
+
+
+def get_first_valid_link(page, element):
+    html = element.get_attribute('innerHTML')
+    soup = BeautifulSoup(html, 'html.parser')
+    remove_first_parenthetical_links(soup)
+    all_links = soup.find_all('a')
+    for link in all_links:
+        href = link.get('href')
+        if href is None:
+            continue
+        # skip red links
+        if 'new' in link.get('class', []):
+            continue
+        if href.startswith('/') or href.startswith('#'):
+            href = urllib.parse.urljoin(page, href)
+        if is_link_valid(href, page):
+            return href
 
 
 def get_first_page_link(page, driver):
     driver.get(page)
-    try:
-        mw_parser_output = driver.find_elements(
-            'css selector',
-            '.mw-content-ltr.mw-parser-output > p'
-        )
-        first_paragraph = [
-            x for x in mw_parser_output if x.text
-        ][0]
-        first_link = [
-            y for y in
-            first_paragraph.find_elements('tag name', 'a')
-            if is_link_valid(y, page)
-        ]
-        return first_link[0].get_attribute('href')
-    except Exception as e:
-        print(f'No link found for {e} on {page}')
-        return None
+    mw_parser_output = driver.find_elements(
+        By.CSS_SELECTOR,
+        '.mw-content-ltr.mw-parser-output > p'
+    )
+    mw_parser_output += driver.find_elements(
+        By.CSS_SELECTOR,
+        '.mw-content-ltr.mw-parser-output > ul'
+    )
+    for p in mw_parser_output:
+        first_valid_link = get_first_valid_link(page, p)
+        if first_valid_link:
+            return first_valid_link
+    return None
 
 
-def is_link_valid(link, page):
-    link_href = link.get_attribute('href')
+def is_link_valid(link_href, page):
     if not link_href.startswith(EN_WIKI):
         return False
     if 'cite_note' in link_href:
-        return False
-    if link_href.startswith(f'{page}#') or link_href.startswith('#'):
         return False
     if NS_REGEX.match(link_href):
         return False
@@ -123,13 +170,17 @@ def run_test(pages, driver, battery):
         while True:
             battery.log(current_page)
             first_link = get_first_page_link(current_page, driver)
+            if first_link is None:
+                print(f'NO LINKS!? Is "{page}" an article?')
+                break_loop = True
             if seen.get(first_link):
                 print(f'Loop detected for {page}')
                 break_loop = True
             if first_link == PHILOSOPHY:
                 print(f'Found philosophy for {page}')
                 break_loop = True
-            seen[first_link] = True
+            if first_link is not None:
+                seen[first_link] = True
             if break_loop:
                 for l,_ in seen.items():
                     print(f'\t- {l}')
