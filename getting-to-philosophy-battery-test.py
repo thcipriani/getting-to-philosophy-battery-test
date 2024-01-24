@@ -161,7 +161,7 @@ def is_link_valid(link_href, page):
     return True
 
 
-def run_test(pages, driver, battery):
+def run_test(pages, driver, battery, delay=0):
     for page in pages:
         seen = {}
         break_loop = False
@@ -169,6 +169,7 @@ def run_test(pages, driver, battery):
 
         while True:
             battery.log(current_page)
+            time.sleep(delay)
             first_link = get_first_page_link(current_page, driver)
             if first_link is None:
                 print(f'NO LINKS!? Is "{page}" an article?')
@@ -205,12 +206,19 @@ def parse_args():
        default=OUTPUT_FILE,
        help='csv file to write battery test results to'
     )
+    ap.add_argument(
+        '--delay',
+        '-d',
+        type=int,
+        default=0,
+        help='delay between page loads in seconds'
+    )
     args = ap.parse_args()
-    return args.input, args.output
+    return args.input, args.output, args.delay
 
 
 def main():
-    pages_file, output_file = parse_args()
+    pages_file, output_file, delay = parse_args()
     with open(pages_file, 'r') as f:
         pages = yaml.safe_load(f)
 
@@ -223,7 +231,7 @@ def main():
             battery = BatteryLog(f)
             while True:
                 print(f'Starting battery test, PASS {test_pass}...')
-                run_test(pages, driver, battery)
+                run_test(pages, driver, battery, delay)
                 test_pass += 1
     except KeyboardInterrupt:
         driver.quit()
